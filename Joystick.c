@@ -25,6 +25,13 @@ these buttons for our use.
  */
 
 #include "Joystick.h"
+#include <avr/io.h>
+#include <util/delay.h>
+
+#include <string.h>
+
+# define USART_BAUDRATE 9600
+# define BAUD_PRESCALE ((( F_CPU / ( USART_BAUDRATE * 16UL))) - 1)
 
 /*
 The following ButtonMap variable defines all possible buttons within the
@@ -91,8 +98,68 @@ void debounce_ports(void) {
 	}
 }
 
+
+void uart_transmit( unsigned char data )
+{
+    // wait for empty transmit buffer
+    while ( ! ( UCSR1A & ( 1 << UDRE1 ) ) )
+        ;
+    
+    // put data into buffer, sends data
+    UDR1 = data;
+}
+
+// read a char from uart
+unsigned char uart_receive(void)
+{
+    while (!( UCSR1A & ( 1 << RXC1) ))
+        ;
+    
+    return UDR1;
+}
+
+// init uart
+void uart_init(void)
+{
+    // set baud rate   
+    unsigned int baud = BAUD_PRESCALE;
+    
+    UBRR1H = (unsigned char) (baud >> 8 );
+    UBRR1L = (unsigned char)baud;
+    
+    // enable received and transmitter
+    UCSR1B = ( 1 << RXEN1 ) | ( 1 << TXEN1 );
+    
+    // set frame format ( 8data, 2stop )
+    UCSR1C = ( 1 << USBS1 ) | ( 3 << UCSZ10 );
+}
+
+// check if there are any chars to be read
+int uart_dataAvailable(void)
+{
+    if ( UCSR1A & ( 1 << RXC1) )
+        return 1;
+    
+    return 0;
+}
+
+// write a string to the uart
+void uart_print( char data[] )
+{
+    int c = 0;
+    
+    for ( c = 0; c < strlen(data); c++ )
+        uart_transmit(data[c]);
+}
+
+
 // Main entry point.
 int main(void) {
+    uart_init();
+    
+    unsigned char receivedChar = '0';
+    
+    uart_print( "\n\rReady :)\n\r" );
 	// We'll start by performing hardware and peripheral setup.
 	SetupHardware();
 	// We'll then enable global interrupts for our use.
@@ -239,58 +306,62 @@ void GetNextReport(USB_JoystickReport_Input_t* const ReportData) {
 	// All of this code here is handled -really poorly-, and should be replaced with something a bit more production-worthy.
 	uint16_t buf_button   = 0x00;
 	uint8_t  buf_joystick = 0x00;
+	unsigned char receivedChar = '0';
 
 	/* Clear the report contents */
 	memset(ReportData, 0, sizeof(USB_JoystickReport_Input_t));
 
-	buf_button   = (~PIND_DEBOUNCED & 0xFF) << (~PINB_DEBOUNCED & 0x08 ? 8 : 0);
-	buf_joystick = (~PINB_DEBOUNCED & 0xFF);
+	ReportData->LX = STICK_CENTER;
+	ReportData->LY = STICK_CENTER;
+	ReportData->RX = STICK_CENTER;
+	ReportData->RY = STICK_CENTER;
+	ReportData->HAT = 0x08;
 
+	if ( uart_dataAvailable() ) {
+		receivedChar = uart_receive();
+		switch(receivedChar) {
+			case 'a':
+				buf_button = 0x04;
+				break;
+			case 'b':
+				buf_button = 0x02;
+				break;
+			case 'y':
+				buf_button = 0x01;
+				break;
+			case 'x':
+				buf_button = 0x08;
+				break;
+			case 'k':
+				ReportData->LY = 0;
+				break;
+			case 'j':
+				ReportData->LY = 255;
+				break;
+			case 'h':
+				ReportData->LX = 0;
+				break;
+			case 'l':
+				ReportData->LX = 255;
+				break;
+			case '8':
+				ReportData->HAT = 0x00;
+				break;
+			case '7':
+				ReportData->HAT = 0x02;
+				break;
+			case '6':
+				ReportData->HAT = 0x04;
+				break;
+			case '5': // Top
+				ReportData->HAT = 0x06;
+				break;
+		}
+	} else {
+		_delay_ms(100);
+	}
 	for (int i = 0; i < 16; i++) {
 		if (buf_button & (1 << i))
 			ReportData->Button |= ButtonMap[i];
-	}
-
-	if (buf_joystick & 0x10)
-		ReportData->LX = 0;
-	else if (buf_joystick & 0x20)
-		ReportData->LX = 255;
-	else
-		ReportData->LX = 128;
-
-	if (buf_joystick & 0x80)
-		ReportData->LY = 0;
-	else if (buf_joystick & 0x40)
-		ReportData->LY = 255;
-	else
-		ReportData->LY = 128;
-
-	switch(buf_joystick & 0xF0) {
-		case 0x80: // Top
-			ReportData->HAT = 0x00;
-			break;
-		case 0xA0: // Top-Right
-			ReportData->HAT = 0x01;
-			break;
-		case 0x20: // Right
-			ReportData->HAT = 0x02;
-			break;
-		case 0x60: // Bottom-Right
-			ReportData->HAT = 0x03;
-			break;
-		case 0x40: // Bottom
-			ReportData->HAT = 0x04;
-			break;
-		case 0x50: // Bottom-Left
-			ReportData->HAT = 0x05;
-			break;
-		case 0x10: // Left
-			ReportData->HAT = 0x06;
-			break;
-		case 0x90: // Top-Left
-			ReportData->HAT = 0x07;
-			break;
-		default:
-			ReportData->HAT = 0x08;
 	}
 }
