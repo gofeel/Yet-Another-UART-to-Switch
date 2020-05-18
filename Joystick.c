@@ -33,6 +33,8 @@ these buttons for our use.
 # define USART_BAUDRATE 9600
 # define BAUD_PRESCALE ((( F_CPU / ( USART_BAUDRATE * 16UL))) - 1)
 
+#define BUF_SIZE 256
+
 /*
 The following ButtonMap variable defines all possible buttons within the
 original 13 bits of space, along with attempting to investigate the remaining
@@ -58,46 +60,15 @@ uint16_t ButtonMap[16] = {
 	0x8000,
 };
 
-/*** Debounce ****
-The following is some -really bad- debounce code. I have a more robust library
-that I've used in other personal projects that would be a much better use
-here, especially considering that this is a stick indented for use with arcade
-fighters.
+//simple round buffer
+char buffer[BUF_SIZE]; // TODO: test buffer is enough
+uint8_t buf_start_position = 0; 
+uint8_t buf_end_position = 0;
 
-This code exists solely to actually test on. This will eventually be replaced.
-**** Debounce ***/
-// Quick debounce hackery!
-// We're going to capture each port separately and store the contents into a 32-bit value.
-uint32_t pb_debounce = 0;
-uint32_t pd_debounce = 0;
 
-// We also need a port state capture. We'll use a 16-bit value for this.
-uint16_t bd_state = 0;
-
-// We'll also give us some useful macros here.
-#define PINB_DEBOUNCED ((bd_state >> 0) & 0xFF)
-#define PIND_DEBOUNCED ((bd_state >> 8) & 0xFF) 
-
-// So let's do some debounce! Lazily, and really poorly.
-void debounce_ports(void) {
-	// We'll shift the current value of the debounce down one set of 8 bits. We'll also read in the state of the pins.
-	pb_debounce = (pb_debounce << 8) + PINB;
-	pd_debounce = (pd_debounce << 8) + PIND;
-
-	// We'll then iterate through a simple for loop.
-	for (int i = 0; i < 8; i++) {
-		if ((pb_debounce & (0x1010101 << i)) == (0x1010101 << i)) // wat
-			bd_state |= (1 << i);
-		else if ((pb_debounce & (0x1010101 << i)) == (0))
-			bd_state &= ~(uint16_t)(1 << i);
-
-		if ((pd_debounce & (0x1010101 << i)) == (0x1010101 << i))
-			bd_state |= (1 << (8 + i));
-		else if ((pd_debounce & (0x1010101 << i)) == (0))
-			bd_state &= ~(uint16_t)(1 << (8 + i));
-	}
-}
-
+uint8_t stick[2][2];
+uint8_t hat;
+uint16_t buf_button;
 
 void uart_transmit( unsigned char data )
 {
@@ -116,6 +87,15 @@ unsigned char uart_receive(void)
         ;
     
     return UDR1;
+}
+
+void reset_button() {
+	stick[0][0] = STICK_CENTER;
+	stick[0][1] = STICK_CENTER;
+	stick[1][0] = STICK_CENTER;
+	stick[1][1] = STICK_CENTER;
+	hat = 0x08;
+	buf_button = 0;
 }
 
 // init uart
@@ -152,14 +132,19 @@ void uart_print( char data[] )
         uart_transmit(data[c]);
 }
 
+void buf_UART() {
+	while(uart_dataAvailable()) {
+		buffer[buf_end_position] = uart_receive();
+		buf_end_position = (buf_end_position + 1) % BUF_SIZE;
+	}
+}
+
 
 // Main entry point.
 int main(void) {
-    uart_init();
-    
-    unsigned char receivedChar = '0';
-    
-    uart_print( "\n\rReady :)\n\r" );
+	reset_button();
+	uart_init();
+	uart_print( "\n\rReady :)\n\r" );
 	// We'll start by performing hardware and peripheral setup.
 	SetupHardware();
 	// We'll then enable global interrupts for our use.
@@ -171,9 +156,7 @@ int main(void) {
 		HID_Task();
 		// We also need to run the main USB management task.
 		USB_USBTask();
-		// As part of this loop, we'll also run our bad debounce code.
-		// Optimally, we should replace this with something that fires on a timer.
-		debounce_ports();
+		buf_UART();
 	}
 }
 
@@ -186,13 +169,6 @@ void SetupHardware(void) {
 	// We need to disable clock division before initializing the USB hardware.
 	clock_prescale_set(clock_div_1);
 	// We can then initialize our hardware and peripherals, including the USB stack.
-
-	// Both PORTD and PORTB will be used for handling the buttons and stick.
-	DDRD  &= ~0xFF;
-	PORTD |=  0xFF;
-
-	DDRB  &= ~0xFF;
-	PORTB |=  0xFF;
 	// The USB stack should be initialized last.
 	USB_Init();
 }
@@ -304,34 +280,55 @@ void HID_Task(void) {
 // Prepare the next report for the host.
 void GetNextReport(USB_JoystickReport_Input_t* const ReportData) {
 	// All of this code here is handled -really poorly-, and should be replaced with something a bit more production-worthy.
-	uint16_t buf_button   = 0x00;
-	uint8_t  buf_joystick = 0x00;
-	unsigned char receivedChar = '0';
+	unsigned char receivedChar;
 
 	/* Clear the report contents */
 	memset(ReportData, 0, sizeof(USB_JoystickReport_Input_t));
 
-	ReportData->LX = STICK_CENTER;
-	ReportData->LY = STICK_CENTER;
-	ReportData->RX = STICK_CENTER;
-	ReportData->RY = STICK_CENTER;
-	ReportData->HAT = 0x08;
-
-	if ( uart_dataAvailable() ) {
-		receivedChar = uart_receive();
-		switch(receivedChar) {
-			case 'a':
-				buf_button = 0x04;
-				break;
-			case 'b':
-				buf_button = 0x02;
-				break;
-			case 'y':
-				buf_button = 0x01;
-				break;
-			case 'x':
-				buf_button = 0x08;
-				break;
+	while(buf_start_position != buf_end_position) {
+		receivedChar = buffer[buf_start_position];
+		uart_transmit(receivedChar);
+		buf_start_position = (buf_start_position + 1) % BUF_SIZE;
+		uint8_t type = (receivedChar & 0b11100000) >> 5;
+		if(type == 1) {
+			uart_transmit('A');
+			uint8_t btn = receivedChar & 0b00001111;
+			uint16_t press = (receivedChar & 0b00010000) >> 4 << btn;
+			uint16_t mask = buf_button = !(0b1 << btn);
+			buf_button = buf_button & mask | press;
+		} else if(type == 2) {
+			uart_transmit('H');
+			hat = (receivedChar & 0b00011111);
+		} else if(type & 0b100) {
+			uint8_t lr = (type & 0b10) >> 1;
+			uint8_t xy = type & 0b1;
+			stick[lr][xy] = (receivedChar & 0b00011111) << 3;
+			if(stick[lr][xy] > 0b10000000) {
+				stick[lr][xy] = stick[lr][xy] + 7;
+			}
+			/*
+			if(receivedChar & 0b00010000) {
+				stick[lr][xy] = stick[lr][xy] + (receivedChar & 0b00001111) >> 1;
+			}
+			*/
+			uart_transmit('T');
+		}
+	}
+	/*
+			switch(receivedChar) {
+				case 'a':
+					buf_button = 0x04;
+					break;
+				case 'b':
+					buf_button = 0x02;
+					break;
+				case 'y':
+					buf_button = 0x01;
+					break;
+				case 'x':
+					buf_button = 0x08;
+					break;
+			}
 			case 'k':
 				ReportData->LY = 0;
 				break;
@@ -356,10 +353,14 @@ void GetNextReport(USB_JoystickReport_Input_t* const ReportData) {
 			case '5': // Top
 				ReportData->HAT = 0x06;
 				break;
-		}
-	} else {
-		_delay_ms(100);
-	}
+	*/
+
+	ReportData->LX = stick[0][0];
+	ReportData->LY = stick[0][1];
+	ReportData->RX = stick[1][0];
+	ReportData->RY = stick[1][1];
+	ReportData->HAT = hat;
+
 	for (int i = 0; i < 16; i++) {
 		if (buf_button & (1 << i))
 			ReportData->Button |= ButtonMap[i];
